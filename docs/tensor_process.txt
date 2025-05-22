@@ -1,0 +1,62 @@
+维度定义:
+B: 批次大小 (Batch size)
+S: 序列长度 (Sequence length)
+d_model: LLM 的隐藏层维度 (也是码本向量的维度)
+V: 词汇表大小 (Vocabulary size)
+K: 码本大小 (Codebook size)，即原型向量的数量，K ≪ V
+1. 输入: LLM 的最终隐藏状态 (h)
+基础 LLM (例如 Transformer 解码器) 处理输入序列，并为每个词元位置生成一个最终的隐藏状态。
+张量: h
+形状: [B, S, d_model]
+例如: [32, 512, 768] (32个序列的批次，每个序列长512个词元，每个词元由一个768维的向量表示)
+2. 计算码本 Logits (L_c)
+隐藏状态 h 投影到码本 C 的转置上。
+码本张量 (C):
+形状: [K, d_model]
+这个矩阵存储了 K 个原型嵌入向量。
+转置码本张量 (C^T):
+形状: [d_model, K]
+操作: 矩阵乘法: L_c = h @ C^T
+概念上，对于 h 中的每个 B*S 个隐藏向量 (每个形状为 [1, d_model])，我们计算它与 C 中所有 K 个码本向量 (或者说 C^T 中的列向量) 的点积。
+结果张量: 码本 Logits (L_c)
+形状: [B, S, K]
+含义: 对于批次中的每个位置 (b,s)，L_c[b,s,:] 是一个长度为 K 的 logits 向量，表示隐藏状态 h[b,s,:] 与 K 个码本向量中每一个的“相似度”或“激活值”。
+例如: [32, 512, 1024] (如果 K=1024)
+3. 将 Logits 分散 (Scatter) 到完整词汇表大小 (L_v)
+这是关键步骤，紧凑的 K 个 logits 通过预定义的映射 M 扩展到完整的词汇表大小 V。
+词汇表到码本的映射 (MAPPING_TENSOR):
+这是一个固定的张量 (查找表)。
+形状: [V]
+内容: 一个整数数组，其中 MAPPING_TENSOR[i] 是分配给第 i 个词汇表词元的码本向量的索引 (从 0 到 K-1)。
+例如: 如果 V=50000, K=1024，那么 MAPPING_TENSOR 有 50000 个条目，每个条目是 0 到 1023 之间的整数。
+操作: 分散 (Scatter) / 收集 (Gather) / 高级索引。
+我们想要创建一个新的张量 L_v，形状为 [B, S, V]。
+对于每个词汇表词元索引 i (从 0 到 V-1):
+目标码本索引 = MAPPING_TENSOR[i]
+L_v[:, :, i] = L_c[:, :, 目标码本索引]
+用类似 PyTorch/NumPy 的表示法 (如论文中 logits_full = logits_c[:,:, MAPPING_TENSOR] 所暗示的):
+L_v = L_c[:, :, MAPPING_TENSOR]
+(这里使用了高级索引。对于输出 L_v 最后一个维度的每个词汇表索引 j，它会查找 MAPPING_TENSOR[j] 来获取一个码本索引，然后从 L_c 中选取对应的 logit 切片。)
+结果张量: 完整词汇表 Logits (L_v)
+形状: [B, S, V]
+含义: 对于每个位置 (b,s)，L_v[b,s,:] 是一个长度为 V 的 logits 向量，准备进行 softmax 操作。如果多个词汇表词元映射到同一个码本向量，则此向量中的许多条目将会是重复的。
+例如: [32, 512, 50000]
+4. 完整 Softmax (P)
+标准的 softmax 函数应用于扩展后的 logits L_v。
+操作: P = softmax(L_v, dim=-1) (在最后一个维度，即 V 上进行 softmax)
+结果张量: 概率 (P)
+形状: [B, S, V]
+含义: 对于每个位置 (b,s)，P[b,s,:] 是在完整词汇表 V 上的概率分布。
+例如: [32, 512, 50000]
+张量流转与形状总结:
+步骤	输入张量与形状	操作	输出张量与形状
+1. LLM 输出	(LLM 内部状态)	LLM 前向传播	h: [B, S, d_model]
+2. 计算码本 Logits	h: [B, S, d_model] <br> C^T: [d_model, K]	矩阵乘法 (@)	L_c: [B, S, K]
+3. 分散 Logits	L_c: [B, S, K] <br> MAPPING_TENSOR: [V] (索引)	分散/收集	L_v: [B, S, V]
+4. 完整 Softmax	L_v: [B, S, V]	Softmax (dim=-1)	P: [B, S, V]
+此流程中涉及的关键可学习参数:
+码本 C: 形状 [K, d_model]。这个参数会被微调或从头开始学习。
+(LLM 中产生 h 的其他参数也会被学习/微调)。
+固定参数 (通常情况下):
+映射 M (由 MAPPING_TENSOR 表示): 形状 [V]。通常是预先计算的 (例如，通过对完整嵌入进行 k-means 聚类得到)，并在 VQ-Logits 训练/微调期间保持固定。
+这个流程使得 VQ-Logits 能够显著减少输出投影层的参数数量 (从 W_out 的 d_model * V 减少到 C 的 d_model * K) 以及主要 logit 计算的计算成本 (与 K 而不是 V 进行矩阵乘法)。分散操作受内存带宽限制，但由于现代硬件上优化的 gather 实现，通常速度很快。
